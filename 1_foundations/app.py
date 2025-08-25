@@ -3,9 +3,12 @@ from openai import OpenAI
 import json
 import os
 import requests
-from pypdf import PdfReader
 import gradio as gr
-
+from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.prompts import ChatPromptTemplate
 
 load_dotenv(override=True)
 
@@ -18,6 +21,61 @@ def push(text):
             "message": text,
         }
     )
+
+def build_vectorstore() -> FAISS:
+    # Load PDFs
+    loader = DirectoryLoader(
+        "me", glob="**/*.pdf", loader_cls=PyPDFLoader, show_progress=True
+    )
+    docs = loader.load()
+
+    # Split into chunks
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splits = splitter.split_documents(docs)
+
+    # Embed + build FAISS index
+    embeddings = OpenAIEmbeddings()
+    vs = FAISS.from_documents(splits, embeddings)
+    return vs
+
+# Use FAISS (kept in memory, but you can persist manually if needed)
+vectorstore = build_vectorstore()
+retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
+def _format_docs(docs) -> str:
+    return "\n\n".join(d.page_content for d in docs)
+
+# A terse, factual QA prompt typical for RAG (keep concise, don’t hallucinate) 
+RAG_QA_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a concise, factual assistant. Use ONLY the provided context. "
+     "If the answer is not in the context, say you don't know."),
+    ("human", "Context:\n{context}\n\nQuestion: {question}\nAnswer in <=3 sentences.")
+])
+
+llm = ChatOpenAI(temperature=0)
+
+def rag_search(question: str) -> str:
+    docs = retriever.invoke(question)
+    context = _format_docs(docs)
+    messages = RAG_QA_PROMPT.format_messages(context=context, question=question)
+    answer = llm.invoke(messages).content
+
+    # Include lightweight sources (URIs or file names + page numbers if present)
+    sources = []
+    for d in docs:
+        meta = d.metadata or {}
+        src = meta.get("source") or meta.get("file_path") or "unknown"
+        page = meta.get("page")
+        sources.append(f"{src}" + (f" (p.{page})" if page is not None else ""))
+
+    unique_sources = sorted(set(sources))
+    # Return a compact JSON-like string so the agent can quote or rephrase as needed
+    payload = {
+        "answer": answer,
+        "sources": unique_sources,
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def record_user_details(email, name="Name not provided", notes="not provided"):
@@ -69,8 +127,25 @@ record_unknown_question_json = {
     }
 }
 
+rag_search_json = {
+    "name": "rag_search",
+    "description": "Use this tool to retrieve Felipe data about his thesis and academic/professional projects",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The user question"
+            }
+        },
+        "required": ["question"],
+        "additionalProperties": False
+    }
+}
+
 tools = [{"type": "function", "function": record_user_details_json},
-        {"type": "function", "function": record_unknown_question_json}]
+        {"type": "function", "function": record_unknown_question_json},
+        {"type": "function", "function": rag_search_json}]
 
 
 class Me:
@@ -78,12 +153,7 @@ class Me:
     def __init__(self):
         self.openai = OpenAI()
         self.name = "Felipe Schreiber Fernandes"
-        reader = PdfReader("me/linkedin.pdf")
         self.linkedin = "https://www.linkedin.com/in/felipe-schreiber/"
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                self.linkedin += text
         with open("me/summary.txt", "r", encoding="utf-8") as f:
             self.summary = f.read()
 
@@ -105,6 +175,7 @@ particularly questions related to {self.name}'s career, background, skills and e
 Your responsibility is to represent {self.name} for interactions on the website as faithfully as possible. \
 You are given a summary of {self.name}'s background and LinkedIn profile which you can use to answer questions. \
 Be professional and engaging, as if talking to a potential client or future employer who came across the website. \
+Everytime someone asks you a question, use the rag_search tool to retrieve useful data.\
 If you don't know the answer to any question, use your record_unknown_question tool to record the question that you couldn't answer, even if it's about something trivial or unrelated to career. \
 If the user is engaging in discussion, try to steer them towards getting in touch via email; ask for their email and record it using your record_user_details tool. "
 
