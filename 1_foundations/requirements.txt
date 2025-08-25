@@ -5,4 +5,5 @@ pypdf
 openai
 openai-agents
 langchain-community
+langchain-openai
 faiss-cpu
